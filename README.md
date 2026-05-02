@@ -1,49 +1,49 @@
 # 🔒 PrivateSearch: Wiki Edition
 
-**PrivateSearch** è un sistema di ricerca documentale semantica, 100% locale e privato, ispirato al paradigma "LLM Wiki" di Andrej Karpathy. 
+**PrivateSearch** is a semantic document search system, 100% local and private, inspired by Andrej Karpathy's "LLM Wiki" paradigm.
 
-A differenza dei sistemi RAG tradizionali, questa versione "Wiki Edition" distilla l'essenza di ogni documento in una sintesi criptata, creando una base di conoscenza ad alta densità di significato, protetta da crittografia militare.
+Unlike traditional RAG systems, the "Wiki Edition" distills the essence of every document into an encrypted summary, creating a high-density knowledge base protected by military-grade encryption.
 
-## 🚀 Caratteristiche Principali
+## 🚀 Key Features
 
-- **Vault Criptato (AES-256)**: Tutti i dati generati dall'IA sono cifrati con una Master Password. Senza di essa, il tuo indice wiki è un ammasso di dati illeggibili.
-- **Sintesi Essenziale**: L'IA (via Ollama) legge i tuoi file (PDF, Immagini via OCR, Testo) e ne crea una "carta d'identità" ultra-concisa (max 20 parole) focalizzata sui fatti.
-- **Point & Open**: Trova un documento tramite chat semantica e aprilo istantaneamente con l'applicazione predefinita del tuo PC (Acrobat, Word, ecc.) con un solo click.
-- **Privacy Totale**: Nessun dato lascia mai il tuo PC. Tutto gira localmente tramite il framework Ollama.
-- **Multi-Vault**: Gestisci diverse cartelle di documenti come vault separati e indipendenti.
+- **Encrypted Vault (AES-256)**: All AI-generated data is encrypted using a Master Password. Without it, your wiki index remains unreadable.
+- **Essential Synthesis**: The AI (via Ollama) reads your files (PDFs, Images via OCR, Text) and creates an ultra-concise "identity card" (max 20 words) focused on facts.
+- **Point & Open**: Find a document via semantic chat and open it instantly using your PC's default application (Acrobat, Word, etc.) with a single click.
+- **Total Privacy**: No data ever leaves your PC. Everything runs locally via the Ollama framework.
+- **Multi-Vault**: Manage different document folders as separate and independent encrypted vaults.
 
-## 🛠️ Requisiti
+## 🛠️ Requirements
 
-- **Linux** (testato su Ubuntu)
-- **Ollama** installato e in esecuzione (`ollama serve`)
+- **Linux** (tested on Ubuntu)
+- **Ollama** installed and running (`ollama serve`)
 - **Python 3.10+**
-- Almeno un modello Qwen2.5 o Llama3 scaricato in Ollama (es. `ollama pull qwen2.5:7b`)
+- At least one Qwen2.5 or Llama3 model downloaded in Ollama (e.g., `ollama pull qwen2.5:7b`)
 
-## 📦 Installazione Rapida
+## 📦 Quick Start
 
-1. Clona la repository nella tua cartella preferita.
-2. Assicurati che Ollama sia attivo.
-3. Avvia lo script di configurazione e avvio:
+1. Clone the repository to your local machine.
+2. Ensure Ollama is running.
+3. Run the startup script:
 
 ```bash
 bash start.sh
 ```
 
-Lo script creerà automaticamente l'ambiente virtuale (`.venv`), installerà le dipendenze e avvierà l'interfaccia web.
+The script will automatically create the virtual environment (`.venv`), install dependencies, and launch the web interface.
 
-## 📖 Come si usa
+## 📖 How to Use
 
-1. **Sblocco**: Vai nella scheda **"Accesso & Config"** e inserisci una Master Password.
-2. **Compilazione**: Nella scheda **"Gestione Wiki"**, inserisci il percorso di una cartella locale e clicca su **"Compila / Aggiorna Wiki"**. L'IA inizierà a leggere e sintetizzare i file.
-3. **Ricerca**: Vai nella scheda **"Ricerca Wiki"**. A destra vedrai l'indice completo dei tuoi file. A sinistra potrai fare domande come: *"Trova i contratti scaduti nel 2023"* o *"C'è un file che parla di Enel?"*.
-4. **Apertura**: Clicca sui pulsanti **"Apri [nome file]"** che appaiono sotto la chat per consultare l'originale.
+1. **Unlock**: Go to the **"Access & Config"** tab and set your Master Password.
+2. **Compile**: In the **"Wiki Management"** tab, enter a local folder path and click **"Compile / Update Wiki"**. The AI will start reading and synthesizing your files.
+3. **Search**: Go to the **"Wiki Search"** tab. You'll see the complete file index on the right. On the left, you can ask questions like: *"Find contracts expired in 2023"* or *"Is there a file mentioning Enel?"*.
+4. **Open**: Click the **"Open [filename]"** buttons that appear below the chat to consult the original document.
 
-## 🔐 Sicurezza
+## 🔐 Security
 
-Il sistema utilizza:
-- **PBKDF2** per la derivazione della chiave dalla tua password.
-- **AES-256 (Fernet)** per la cifratura dei file `.wiki.enc`.
-- **OCR Locale**: Per le immagini e i PDF scansiti, il riconoscimento del testo avviene interamente sul tuo PC.
+The system implements:
+- **PBKDF2** for key derivation from your password.
+- **AES-256 (Fernet)** for `.wiki.enc` file encryption.
+- **Local OCR**: Text recognition for images and scanned PDFs happens entirely on your machine.
 
 ---
-*PrivateSearch — La tua conoscenza, protetta e interpellabile.*
+*PrivateSearch — Your knowledge, protected and searchable.*
