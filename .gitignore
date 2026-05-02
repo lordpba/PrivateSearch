@@ -6,3 +6,4 @@ docker/.env
 .env
 *.egg-info/
 .vscode/
+.venv

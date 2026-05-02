@@ -186,6 +186,7 @@ class UserConfig:
     ollama_host: str = ""
     first_run_done: bool = False
     models_downloaded: bool = False
+    active_vault: str = "default_vault"
 
     def save(self):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -214,13 +215,19 @@ class UserConfig:
 
     @property
     def required_models(self) -> list[str]:
-        """Embedding + the profile's unified model (chat & OCR are the same)."""
-        models = {EMBEDDING_MODEL, self.chat_model}
-        return sorted(models)
+        """The profile's unified model."""
+        return [self.chat_model]
 
 
 def get_active_model() -> str:
-    """Get the active qwen3.5 model for the current profile.
-    Since qwen3.5 is unified (vision + language), this is used for BOTH chat and OCR."""
+    """Get the active qwen3.5 model for the current profile."""
     config = UserConfig.load()
     return config.chat_model
+
+def get_vault_name(folder_path: str) -> str:
+    """Derive a vault name from a folder path."""
+    import hashlib
+    # Use folder basename + short hash of full path to avoid collisions
+    folder_name = Path(folder_path).name or "vault"
+    path_hash = hashlib.md5(folder_path.encode()).hexdigest()[:8]
+    return f"{folder_name}_{path_hash}"

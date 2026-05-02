@@ -18,19 +18,19 @@ import gradio as gr
 import httpx
 
 from app.config import (
-    OLLAMA_HOST, EMBEDDING_MODEL, PROFILES,
+    OLLAMA_HOST, PROFILES,
     ALL_EXTENSIONS, GRADIO_HOST, GRADIO_PORT,
     APP_TITLE, APP_SUBTITLE, UserConfig, DATA_DIR,
     host_to_container_path, container_to_host_path,
     set_ollama_host, get_ollama_host, get_active_model,
+    get_vault_name
 )
 from app.indexer.document_loader import scan_folder, load_documents
 from app.indexer.ocr_engine import OCREngine
-from app.indexer.text_chunker import chunk_documents
-from app.indexer.embedder import Embedder
-from app.search.vector_store import VectorStore
-from app.search.retriever import Retriever
-from app.llm.chat_engine import ChatEngine
+from app.indexer.wiki_compiler import WikiCompiler
+from app.search.wiki_store import WikiStore
+from app.core.security import security
+from app.core.file_utils import open_file
 from app.ui.theme import create_theme, CUSTOM_CSS
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -44,21 +44,28 @@ logger = logging.getLogger("PrivateSearch")
 
 # ─── Global state ─────────────────────────────────────────────────────────────
 
-vector_store: VectorStore | None = None
-embedder: Embedder | None = None
-retriever: Retriever | None = None
-chat_engine: ChatEngine | None = None
+wiki_store: WikiStore | None = None
+wiki_compiler: WikiCompiler | None = None
 ocr_engine: OCREngine | None = None
 
 
-def init_components():
-    """Initialize all components."""
-    global vector_store, embedder, retriever, chat_engine, ocr_engine
-    vector_store = VectorStore()
-    embedder = Embedder()
+def init_components(vault_name: str = "default_vault"):
+    """Initialize wiki components."""
+    global wiki_store, wiki_compiler, ocr_engine
+    wiki_store = WikiStore(vault_name)
+    wiki_compiler = WikiCompiler(wiki_store)
     ocr_engine = OCREngine()
-    retriever = Retriever(vector_store, embedder)
-    chat_engine = ChatEngine(retriever)
+
+
+def update_wiki_list():
+    """Returns a markdown list of all entries in the wiki."""
+    if not wiki_store or wiki_store.is_empty:
+        return "_Il wiki è vuoto o bloccato._"
+    
+    lines = ["### 📚 Indice Wiki\n"]
+    for e in sorted(wiki_store.entries, key=lambda x: x['filename']):
+        lines.append(f"- **{e['filename']}**\n  _{e['summary']}_")
+    return "\n".join(lines)
 
 
 # ─── Ollama helpers ───────────────────────────────────────────────────────────
@@ -222,23 +229,51 @@ def on_change_ollama_url(url: str):
         return f"❌ {url} — {msg}"
 
 
+def on_unlock_vault(password: str):
+    """Attempt to unlock the vault with the provided password."""
+    if not password:
+        return "❌ Inserisci una password."
+    
+    if security.derive_key(password):
+        config = UserConfig.load()
+        init_components(config.active_vault)
+        if wiki_store.load():
+            return "✅ Vault sbloccato correttamente!"
+        else:
+            return "❌ Impossibile caricare il vault. Password errata o dati corrotti."
+    return "❌ Errore nella generazione della chiave."
+
+
+def on_open_local_file(filepath: str):
+    """Open a file on the local system."""
+    # We need to translate back to host path if in Docker
+    host_path = container_to_host_path(filepath)
+    if open_file(host_path):
+        return f"✅ Apertura in corso: {host_path}"
+    return f"❌ Impossibile aprire il file: {host_path}"
+
+
 def on_check_folder(folder_path: str):
     """Check folder and detect changes."""
     if not folder_path:
         return "❌ Inserisci un percorso.", ""
 
-    # Translate host path → container path for Docker environments
+    if not security.is_unlocked:
+        return "🔒 Sblocca il vault con la password nella scheda Configurazione prima di procedere.", ""
+
     actual_path = host_to_container_path(folder_path.strip())
-    logger.info(f"Folder check: user='{folder_path}' → actual='{actual_path}'")
-
     if not Path(actual_path).exists():
-        msg = f"❌ Cartella non trovata: {folder_path}"
-        if HOST_HOME_PATH:
-            msg += f"\n\nℹ️ Il percorso deve essere dentro la tua home directory ({HOST_HOME_PATH})."
-        return msg, ""
+        return f"❌ Cartella non trovata: {folder_path}", ""
 
-    if not Path(actual_path).is_dir():
-        return "❌ Il percorso non è una cartella.", ""
+    vault_name = get_vault_name(folder_path.strip())
+    config = UserConfig.load()
+    config.folder_path = folder_path.strip()
+    config.active_vault = vault_name
+    config.save()
+
+    # Re-init with correct vault
+    init_components(vault_name)
+    wiki_store.load()
 
     try:
         files = scan_folder(actual_path, ALL_EXTENSIONS)
@@ -248,278 +283,188 @@ def on_check_folder(folder_path: str):
     if not files:
         return "⚠️ Nessun file supportato trovato nella cartella.", ""
 
-    # Save the user-facing (host) path for display
-    config = UserConfig.load()
-    config.folder_path = folder_path.strip()
-    config.save()
-
-    # Count by type
-    from app.config import SUPPORTED_EXTENSIONS
-    counts = {}
-    for f in files:
-        for category, exts in SUPPORTED_EXTENSIONS.items():
-            if f["extension"] in exts:
-                counts[category] = counts.get(category, 0) + 1
-                break
-
-    # Check vector store for changes
-    init_components()
-    changes = vector_store.detect_changes(files)
+    # Check which files are already in the wiki
+    existing_paths = {e["filepath"] for e in wiki_store.entries}
+    new_files = [f for f in files if f["path"] not in existing_paths]
 
     summary = f"📂 {folder_path.strip()}\n\n"
-    summary += f"📄 **{len(files)} file** trovati:\n"
-    for cat, count in sorted(counts.items()):
-        icons = {"text": "📝", "document": "📄", "image": "🖼️"}
-        summary += f"  {icons.get(cat, '📎')} {cat}: {count}\n"
+    summary += f"📦 **Vault:** `{vault_name}`\n"
+    summary += f"📄 **{len(files)} file** trovati.\n"
 
-    total_size = sum(f["size"] for f in files)
-    summary += f"\n💾 Dimensione totale: {total_size / (1024*1024):.1f} MB\n"
-
-    changes_text = ""
-    if changes["new"] or changes["modified"] or changes["deleted"]:
-        changes_text = "⚠️ **Modifiche rilevate:**\n"
-        if changes["new"]:
-            changes_text += f"  🟢 {len(changes['new'])} file nuovi\n"
-            for f in changes["new"][:5]:
-                changes_text += f"    + {f['name']}\n"
-            if len(changes["new"]) > 5:
-                changes_text += f"    ... e altri {len(changes['new']) - 5}\n"
-        if changes["modified"]:
-            changes_text += f"  🟡 {len(changes['modified'])} file modificati\n"
-            for f in changes["modified"][:5]:
-                changes_text += f"    ~ {f['name']}\n"
-        if changes["deleted"]:
-            changes_text += f"  🔴 {len(changes['deleted'])} file rimossi\n"
-            for fp in changes["deleted"][:5]:
-                changes_text += f"    - {Path(fp).name}\n"
-        changes_text += "\n**Clicca 'Indicizza' per aggiornare.**"
-    elif not vector_store.is_empty:
-        stats = vector_store.get_stats()
-        changes_text = (
-            f"✅ **Indice aggiornato** — nessuna modifica rilevata\n"
-            f"  📊 {stats['total_chunks']} sezioni indicizzate da {stats['total_files']} file\n\n"
-            f"Puoi iniziare a cercare!"
-        )
+    if new_files:
+        changes_text = f"⚠️ **{len(new_files)} nuovi file** da processare.\n\n**Clicca 'Compila Wiki' per iniziare.**"
+    elif not wiki_store.is_empty:
+        changes_text = f"✅ **Wiki aggiornato** ({len(wiki_store.entries)} file descritti).\n\nPuoi iniziare la ricerca semantica!"
     else:
-        changes_text = "🆕 **Prima indicizzazione necessaria.** Clicca 'Indicizza documenti'."
+        changes_text = "🆕 **Nessuna descrizione presente.** Clicca 'Compila Wiki'."
 
     return summary, changes_text
 
 
-def on_index_documents(folder_path: str, progress=gr.Progress()):
-    """Run the full indexing pipeline: scan → load → OCR → chunk → embed → store.
-    Yields intermediate Markdown updates so the user sees real-time progress.
-    """
+def on_compile_wiki(folder_path: str, progress=gr.Progress()):
+    """Run the wiki compilation pipeline: scan → load → summary → store."""
+    if not security.is_unlocked:
+        yield "❌ Vault bloccato. Inserisci la password nella scheda Configurazione."
+        return
+
     actual_path = host_to_container_path(folder_path.strip()) if folder_path else ""
     if not actual_path or not Path(actual_path).is_dir():
         yield "❌ Cartella non valida."
         return
 
-    init_components()
+    vault_name = get_vault_name(folder_path.strip())
+    init_components(vault_name)
+    wiki_store.load()
+
     t0 = time.time()
 
-    # Helper: build a live status block
-    def _status(phase: str, detail: str, file_num: int = 0,
-                total: int = 0, processed_ok: int = 0, errors: int = 0):
+    def _status(phase: str, detail: str, file_num: int = 0, total: int = 0):
         pct = int(file_num / total * 100) if total else 0
-        bar_done = pct // 5          # 20-char bar
-        bar_left = 20 - bar_done
-        bar = "█" * bar_done + "░" * bar_left
         elapsed = time.time() - t0
-        lines = [
-            f"### ⏳ Indicizzazione in corso…\n",
-            f"**Fase:** {phase}\n",
-            f"**Progresso:** `{bar}` {pct}%  —  file {file_num}/{total}\n",
-            f"**File corrente:** {detail}\n",
-            f"⏱️ Tempo trascorso: {elapsed:.0f}s",
-        ]
-        if processed_ok or errors:
-            lines.append(f"  ·  ✅ {processed_ok} ok")
-            if errors:
-                lines.append(f"  ·  ⚠️ {errors} saltati")
-        return "\n".join(lines)
-
-    # 1. Scan folder ──────────────────────────────────────────────
-    yield _status("Scansione cartella", folder_path.strip())
-    progress(0.0, "Scansione cartella...")
-    files = scan_folder(actual_path, ALL_EXTENSIONS)
-    if not files:
-        yield "⚠️ Nessun file supportato trovato."
-        return
-
-    # 2. Detect changes ───────────────────────────────────────────
-    yield _status("Rilevamento modifiche", f"{len(files)} file trovati")
-    changes = vector_store.detect_changes(files)
-    files_to_process = changes["new"] + changes["modified"]
-
-    # 3. Handle deletions ─────────────────────────────────────────
-    for deleted_path in changes["deleted"]:
-        yield _status("Rimozione file obsoleti", Path(deleted_path).name)
-        progress(0.05, f"Rimozione {Path(deleted_path).name}...")
-        vector_store.remove_file(deleted_path)
-
-    if not files_to_process and not changes["deleted"]:
-        stats = vector_store.get_stats()
-        yield (
-            f"✅ Nessuna modifica da processare.\n\n"
-            f"📊 {stats['total_chunks']} sezioni da {stats['total_files']} file."
+        return (
+            f"### 📝 Compilazione Wiki in corso…\n"
+            f"**Fase:** {phase}\n"
+            f"**Progresso:** {pct}%  —  file {file_num}/{total}\n"
+            f"**File corrente:** `{detail}`\n"
+            f"⏱️ Tempo trascorso: {elapsed:.0f}s"
         )
+
+    # 1. Scan folder
+    yield _status("Scansione cartella", folder_path.strip())
+    files = scan_folder(actual_path, ALL_EXTENSIONS)
+    
+    # Identify files that need compilation
+    existing_paths = {e["filepath"] for e in wiki_store.entries}
+    files_to_process = [f for f in files if f["path"] not in existing_paths]
+    
+    if not files_to_process:
+        yield f"✅ Wiki già aggiornato con {len(wiki_store.entries)} file."
         return
 
     total_files = len(files_to_process)
     processed = 0
-    skipped = 0
-    total_chunks_added = 0
 
-    # 4. Process each file ────────────────────────────────────────
-    for fi, file_info in enumerate(files_to_process):
-        file_progress_base = 0.1 + (fi / total_files) * 0.85
+    for i, file_info in enumerate(files_to_process):
         fp = Path(file_info["path"])
-
-        # ── 4a. Load document ────────────────────────────────────
-        phase = "Caricamento documento"
-        yield _status(phase, fp.name, fi + 1, total_files, processed, skipped)
-        progress(file_progress_base, f"[{fi+1}/{total_files}] {fp.name}...")
+        yield _status("Generazione sintesi", fp.name, i + 1, total_files)
+        progress((i) / total_files, f"Elaborazione {fp.name}...")
 
         try:
-            docs, ocr_queue = load_documents(
-                actual_path, [file_info],
-                progress_callback=lambda p, m: progress(file_progress_base + p * 0.2 / total_files, m),
-            )
-        except Exception as e:
-            logger.error(f"Load failed for {fp.name}: {e}")
-            skipped += 1
-            continue
-
-        # ── 4b. OCR if needed ────────────────────────────────────
-        if ocr_queue:
-            phase = "OCR (riconoscimento testo)"
-            yield _status(phase, fp.name, fi + 1, total_files, processed, skipped)
-            progress(file_progress_base + 0.2 / total_files, f"OCR: {fp.name}...")
-            try:
-                ocr_docs = ocr_engine.process_ocr_queue(
-                    ocr_queue,
-                    progress_callback=lambda p, m: progress(
-                        file_progress_base + (0.2 + p * 0.3) / total_files, m
-                    ),
-                )
+            # Load text (handles PDF, OCR, etc.)
+            docs, ocr_queue = load_documents(actual_path, [file_info])
+            
+            # Simple OCR if queue exists
+            if ocr_queue:
+                ocr_docs = ocr_engine.process_ocr_queue(ocr_queue)
                 docs.extend(ocr_docs)
-            except Exception as e:
-                logger.error(f"OCR failed for {fp.name}: {e}")
-
-        if not docs:
-            logger.warning(f"No text extracted from {fp.name}")
-            skipped += 1
-            continue
-
-        # ── 4c. Chunk ────────────────────────────────────────────
-        phase = "Suddivisione testo"
-        yield _status(phase, fp.name, fi + 1, total_files, processed, skipped)
-        progress(file_progress_base + 0.5 / total_files, f"Suddivisione: {fp.name}...")
-        chunks = chunk_documents(docs)
-
-        if not chunks:
-            skipped += 1
-            continue
-
-        # ── 4d. Embed ────────────────────────────────────────────
-        phase = "Generazione embedding"
-        yield _status(phase, f"{fp.name} ({len(chunks)} sezioni)", fi + 1, total_files, processed, skipped)
-        progress(file_progress_base + 0.6 / total_files, f"Embedding: {fp.name}...")
-        texts = [c.text for c in chunks]
-        embeddings = embedder.embed_batch(
-            texts,
-            progress_callback=lambda p, m: progress(
-                file_progress_base + (0.6 + p * 0.3) / total_files, m
-            ),
-        )
-
-        # ── 4e. Store ────────────────────────────────────────────
-        phase = "Salvataggio nell'indice"
-        yield _status(phase, fp.name, fi + 1, total_files, processed, skipped)
-        progress(file_progress_base + 0.9 / total_files, f"Salvataggio: {fp.name}...")
-        try:
-            if file_info in changes["modified"]:
-                vector_store.update_file(chunks, embeddings, file_info)
-            else:
-                vector_store.add_chunks(chunks, embeddings, file_info)
+            
+            full_text = "\n".join(d.text for d in docs)
+            
+            # Compile Wiki Entry
+            wiki_compiler.compile_file(file_info["name"], file_info["path"], full_text)
+            processed += 1
+            
+            # Save incrementally every 5 files
+            if processed % 5 == 0:
+                wiki_store.save()
+                
         except Exception as e:
-            logger.error(f"Store failed for {fp.name}: {e}")
-            skipped += 1
-            continue
+            logger.error(f"Failed to process {fp.name}: {e}")
 
-        processed += 1
-        total_chunks_added += len(chunks)
-
-    progress(1.0, "Indicizzazione completata!")
-
+    # Final save
+    wiki_store.save()
     elapsed = time.time() - t0
-    stats = vector_store.get_stats()
-
-    result = f"### ✅ Indicizzazione completata!\n\n"
-    result += f"| | |\n|---|---|\n"
-    result += f"| 📄 File elaborati | **{processed}** / {total_files} |\n"
-    if skipped:
-        result += f"| ⚠️ File saltati | **{skipped}** |\n"
-    if changes["deleted"]:
-        result += f"| 🗑️ File rimossi | **{len(changes['deleted'])}** |\n"
-    result += f"| 📊 Sezioni create | **{total_chunks_added}** |\n"
-    result += f"| 📊 Totale nell'indice | **{stats['total_chunks']}** sezioni da **{stats['total_files']}** file |\n"
-    result += f"| ⏱️ Tempo | **{elapsed:.0f}** secondi |\n"
-    result += f"\n🎉 Puoi iniziare a cercare nella scheda **💬 Chat**!"
-    yield result
+    
+    yield (
+        f"### ✅ Wiki Compilato!\n\n"
+        f"| | |\n|---|---|\n"
+        f"| 📄 File nuovi elaborati | **{processed}** |\n"
+        f"| 📊 Totale nel Wiki | **{len(wiki_store.entries)}** file |\n"
+        f"| ⏱️ Tempo | **{elapsed:.0f}** secondi |\n"
+        f"\n🎉 Il tuo vault criptato è pronto per la consultazione."
+    )
 
 
 def on_chat_message(message: str, history: list):
-    """Handle a chat message with RAG."""
+    """Handle a chat message using the Wiki summaries."""
     if not message or not message.strip():
         return history, ""
 
-    # Check if index exists
-    if vector_store is None or vector_store.is_empty:
+    if not security.is_unlocked or not wiki_store:
         history.append({"role": "user", "content": message})
         history.append({
             "role": "assistant",
-            "content": "⚠️ Nessun documento indicizzato. Vai nella scheda **📂 Documenti** e indicizza una cartella prima di cercare.",
+            "content": "🔒 Il vault è bloccato. Inserisci la password nella scheda **Configurazione**.",
+        })
+        return history, ""
+
+    if wiki_store.is_empty:
+        history.append({"role": "user", "content": message})
+        history.append({
+            "role": "assistant",
+            "content": "⚠️ Wiki vuoto. Vai nella scheda **📂 Documenti** e compila il wiki per questa cartella.",
         })
         return history, ""
 
     history.append({"role": "user", "content": message})
 
-    # Stream response
-    response_text = ""
-    sources = []
-    for partial, src in chat_engine.ask(message):
-        response_text = partial
-        sources = src
+    # 1. Prepare Wiki context (all summaries)
+    wiki_context = "\n".join([
+        f"- FILE: {e['filename']}\n  SINTESI: {e['summary']}\n  PATH: {e['filepath']}"
+        for e in wiki_store.entries
+    ])
 
-    # Format sources — show only top relevant ones to avoid clutter
-    MAX_DISPLAY_SOURCES = 6
-    MIN_DISPLAY_SCORE = 0.55
-    sources_text = ""
-    if sources:
-        # Filter by minimum score, then take top N
-        display_sources = [s for s in sources if s['score'] >= MIN_DISPLAY_SCORE]
-        if not display_sources:
-            # If nothing passes threshold, show at least top 3
-            display_sources = sorted(sources, key=lambda s: s['score'], reverse=True)[:3]
-        display_sources = display_sources[:MAX_DISPLAY_SOURCES]
+    # 2. Ask LLM to find relevant files
+    prompt = (
+        "Sei un assistente alla ricerca documentale.\n"
+        "Sotto hai un elenco di file con le loro sintesi.\n"
+        "Il tuo compito è rispondere alla domanda dell'utente indicando i file più pertinenti.\n\n"
+        "ELENCO WIKI:\n"
+        f"{wiki_context}\n\n"
+        "RISPONDI COSI':\n"
+        "1. Fornisci una risposta breve basandoti sulle sintesi.\n"
+        "2. Elenca i file trovati usando ESATTAMENTE questo formato per i link:\n"
+        "   `[APRI: percorso/completo/del/file]`\n\n"
+        "Non inventare informazioni non presenti nelle sintesi."
+    )
 
-        sources_text = "\n\n---\n📋 **Fonti:**\n"
-        for s in display_sources:
-            page_str = f", pag. {s['page']}" if s['page'] else ""
-            sources_text += f"- **{s['filename']}**{page_str} (rilevanza: {s['score']:.0%})\n"
-        if len(sources) > len(display_sources):
-            sources_text += f"- _...e altri {len(sources) - len(display_sources)} documenti consultati_\n"
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": message}
+    ]
 
-    history.append({"role": "assistant", "content": response_text + sources_text})
-    return history, ""
+    # 3. Stream response
+    full_response = ""
+    host = get_ollama_host()
+    model = get_active_model()
+
+    try:
+        with httpx.stream(
+            "POST",
+            f"{host}/api/chat",
+            json={
+                "model": model,
+                "messages": messages,
+                "stream": True,
+                "options": {"temperature": 0.1}
+            },
+            timeout=120.0
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line:
+                    data = json.loads(line)
+                    token = data.get("message", {}).get("content", "")
+                    full_response += token
+                    yield history + [{"role": "assistant", "content": full_response}], ""
+    except Exception as e:
+        yield history + [{"role": "assistant", "content": f"❌ Errore LLM: {e}"}], ""
+
+    return history + [{"role": "assistant", "content": full_response}], ""
 
 
 def on_clear_chat():
     """Clear chat history."""
-    if chat_engine:
-        chat_engine.clear_history()
     return [], ""
 
 
@@ -549,192 +494,202 @@ def create_app() -> gr.Blocks:
         gr.HTML(
             f"""
             <div style="text-align: center; padding: 20px 0 10px 0;">
-                <h1 class="app-title">🔒 {APP_TITLE}</h1>
+                <h1 class="app-title">🔒 {APP_TITLE} <span style="font-size: 0.5em; vertical-align: middle; opacity: 0.7;">Wiki Edition</span></h1>
                 <p class="app-subtitle">{APP_SUBTITLE}</p>
             </div>
             <div class="security-banner">
                 <span class="lock-icon">🛡️</span>
-                100% LOCALE — I tuoi dati non lasciano mai questo dispositivo.
-                Nessuna connessione internet richiesta dopo la configurazione.
+                100% LOCALE & CRIPTATO — Vault protetto da AES-256.
             </div>
             """
         )
 
         with gr.Tabs() as tabs:
 
-            # ═══════════════ TAB 1: SETUP ═══════════════════════
-            with gr.Tab("⚙️ Configurazione", id="setup"):
-                gr.Markdown("### Configurazione iniziale")
-                gr.Markdown(
-                    "Verifica che Ollama sia installato e i modelli siano scaricati."
-                )
-
+            # ═══════════════ TAB 1: CONFIG & UNLOCK ═══════════════════════
+            with gr.Tab("⚙️ Accesso & Config", id="setup"):
                 with gr.Row():
                     with gr.Column(scale=2):
-                        system_status = gr.Textbox(
-                            label="Stato del sistema",
-                            lines=8,
-                            interactive=False,
-                            value="Clicca 'Verifica sistema' per controllare...",
+                        gr.Markdown("### 🔑 Sblocca il tuo Vault")
+                        password_input = gr.Textbox(
+                            label="Master Password",
+                            placeholder="Inserisci la password per sbloccare o creare il wiki...",
+                            type="password",
                         )
-                    with gr.Column(scale=1):
-                        check_btn = gr.Button("🔍 Verifica sistema", variant="secondary")
-                        download_btn = gr.Button("📥 Scarica modelli", variant="primary")
+                        unlock_btn = gr.Button("🔓 Sblocca Vault", variant="primary")
+                        unlock_status = gr.Markdown("Vault bloccato.")
 
-                gr.Markdown("### Profilo hardware")
-                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("### 🖥️ Stato Sistema")
+                        system_status = gr.Textbox(
+                            label="Ollama Status",
+                            lines=4,
+                            interactive=False,
+                            value="Verifica in corso...",
+                        )
+                        check_btn = gr.Button("🔍 Verifica", variant="secondary")
+
+                with gr.Accordion("Impostazioni Hardware", open=False):
                     profile_radio = gr.Radio(
                         choices=[
-                            ("⚡ Veloce — GPU 4 GB, risposte rapide (qwen3.5:4b)", "fast"),
-                            ("🎯 Preciso — GPU 8 GB, risposte accurate (qwen3.5:9b)", "precise"),
-                            ("🚀 Massimo — 2× GPU 12 GB, un modello per tutto (qwen3.5:27b)", "maximum"),
-                            ("🖥️ DGX — Modello 35B (qwen3.5:35b)", "custom"),
+                            ("⚡ Veloce — GPU 4 GB (qwen3.5:4b)", "fast"),
+                            ("🎯 Preciso — GPU 8 GB (qwen3.5:9b)", "precise"),
+                            ("🚀 Massimo — 2× GPU 12 GB (qwen3.5:27b)", "maximum"),
                         ],
                         value=UserConfig.load().profile,
-                        label="Seleziona il profilo adatto alla tua GPU",
-                        interactive=True,
+                        label="Profilo GPU",
                     )
-                profile_status = gr.Textbox(
-                    label="",
-                    interactive=False,
-                    visible=True,
-                    max_lines=1,
-                )
+                    ollama_url_input = gr.Textbox(
+                        label="URL server Ollama",
+                        value=get_ollama_host(),
+                    )
 
-                gr.Markdown("### Server Ollama")
+            # ═══════════════ TAB 2: WIKI COMPILER ═══════════════════
+            with gr.Tab("📂 Gestione Wiki", id="documents"):
+                gr.Markdown("### 📚 Compilazione Wiki della Cartella")
                 gr.Markdown(
-                    "Indirizzo del server Ollama. Lascia vuoto per usare localhost (predefinito). "
-                    "Puoi inserire un server remoto (es. `http://192.168.1.100:11434`)."
-                )
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        _saved_cfg = UserConfig.load()
-                        ollama_url_input = gr.Textbox(
-                            label="URL server Ollama",
-                            value=_saved_cfg.ollama_host or get_ollama_host(),
-                            placeholder="http://localhost:11434",
-                            interactive=True,
-                            max_lines=1,
-                        )
-                    with gr.Column(scale=1):
-                        ollama_url_status = gr.Textbox(
-                            label="Stato connessione",
-                            interactive=False,
-                            max_lines=1,
-                        )
-
-                check_btn.click(fn=on_check_system, outputs=system_status)
-                download_btn.click(fn=on_download_models, outputs=system_status)
-                profile_radio.change(fn=on_select_profile, inputs=profile_radio, outputs=profile_status)
-                ollama_url_input.submit(fn=on_change_ollama_url, inputs=ollama_url_input, outputs=ollama_url_status)
-                ollama_url_input.blur(fn=on_change_ollama_url, inputs=ollama_url_input, outputs=ollama_url_status)
-
-            # ═══════════════ TAB 2: DOCUMENTI ═══════════════════
-            with gr.Tab("📂 Documenti", id="documents"):
-                gr.Markdown("### Cartella documenti")
-                gr.Markdown(
-                    "Inserisci il percorso completo della cartella contenente i documenti da indicizzare. "
-                    "Funziona sia con percorsi Linux (`/home/mario/Documenti`) che Windows (`C:\\Users\\mario\\Documents`)."
+                    "Seleziona una cartella. L'IA genererà una sintesi essenziale criptata per ogni file."
                 )
 
                 with gr.Row():
                     folder_input = gr.Textbox(
-                        label="Percorso cartella",
-                        placeholder="/home/mario/Documenti  oppure  C:\\Users\\mario\\Documents",
+                        label="Percorso cartella locale",
+                        placeholder="/home/mario/Documenti",
                         value=UserConfig.load().folder_path,
                         scale=3,
                     )
-                    check_folder_btn = gr.Button("🔍 Controlla", variant="secondary", scale=1)
+                    check_folder_btn = gr.Button("🔍 Analizza Cartella", variant="secondary", scale=1)
 
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        folder_info = gr.Markdown("Inserisci un percorso e clicca 'Controlla'.")
-                    with gr.Column(scale=1):
-                        changes_info = gr.Markdown("")
+                    folder_info = gr.Markdown("Inserisci un percorso.")
+                    changes_info = gr.Markdown("")
 
-                index_btn = gr.Button(
-                    "🚀 Indicizza documenti",
+                compile_btn = gr.Button(
+                    "📝 Compila / Aggiorna Wiki",
                     variant="primary",
                     size="lg",
                 )
-                index_result = gr.Markdown("")
+                compile_result = gr.Markdown("")
 
-                with gr.Accordion("🛠️ Strumenti avanzati", open=False):
-                    clear_index_btn = gr.Button("🗑️ Elimina indice e cache", variant="stop")
+                with gr.Accordion("⚠️ Zona Pericolosa", open=False):
+                    clear_wiki_btn = gr.Button("🗑️ Elimina questo Wiki", variant="stop")
                     clear_result = gr.Textbox(label="", interactive=False)
 
-                check_folder_btn.click(
-                    fn=on_check_folder,
-                    inputs=folder_input,
-                    outputs=[folder_info, changes_info],
-                )
-                index_btn.click(
-                    fn=on_index_documents,
-                    inputs=folder_input,
-                    outputs=index_result,
-                )
-                clear_index_btn.click(
-                    fn=on_clear_index,
-                    outputs=clear_result,
-                )
-
-            # ═══════════════ TAB 3: CHAT ════════════════════════
-            with gr.Tab("💬 Chat", id="chat"):
-                chatbot = gr.Chatbot(
-                    label="",
-                    height=500,
-                    type="messages",
-                    show_copy_button=True,
-                    placeholder=(
-                        "🔒 **PrivateSearch**\n\n"
-                        "Chiedimi qualsiasi cosa sui tuoi documenti.\n\n"
-                        "_Esempi:_\n"
-                        '- "Quali sono le analisi mediche di Mario del 2020?"\n'
-                        '- "Elenca i documenti relativi alla proprietà in Italia"\n'
-                        '- "Qual è la scadenza del contratto assicurativo?"'
-                    ),
-                )
-
+            # ═══════════════ TAB 3: RICERCA SEMANTICA ════════════════════════
+            with gr.Tab("💬 Ricerca Wiki", id="chat"):
                 with gr.Row():
-                    chat_input = gr.Textbox(
-                        placeholder="Scrivi la tua domanda...",
-                        show_label=False,
-                        scale=5,
-                        container=False,
-                    )
-                    send_btn = gr.Button("Invia", variant="primary", scale=1)
+                    with gr.Column(scale=2):
+                        chatbot = gr.Chatbot(
+                            label="",
+                            height=550,
+                            type="messages",
+                            show_copy_button=True,
+                            placeholder=(
+                                "📚 **Il tuo Wiki Criptato**\n\n"
+                                "Chiedimi cosa cerchi. Esempio: 'Trova le fatture Enel del 2023'.\n\n"
+                                "I file trovati appariranno qui sotto."
+                            ),
+                        )
 
-                with gr.Row():
-                    clear_chat_btn = gr.Button("🗑️ Nuova conversazione", variant="secondary", size="sm")
+                        with gr.Row():
+                            chat_input = gr.Textbox(
+                                placeholder="Cosa stai cercando?",
+                                show_label=False,
+                                scale=5,
+                                container=False,
+                            )
+                            send_btn = gr.Button("Cerca", variant="primary", scale=1)
 
-                # Chat events
-                send_btn.click(
-                    fn=on_chat_message,
-                    inputs=[chat_input, chatbot],
-                    outputs=[chatbot, chat_input],
-                )
-                chat_input.submit(
-                    fn=on_chat_message,
-                    inputs=[chat_input, chatbot],
-                    outputs=[chatbot, chat_input],
-                )
-                clear_chat_btn.click(
-                    fn=on_clear_chat,
-                    outputs=[chatbot, chat_input],
-                )
+                        gr.Markdown("### 📄 File trovati nell'ultima ricerca")
+                        with gr.Row():
+                            found_files_container = gr.HTML("<p style='opacity: 0.5;'>Nessun file aperto di recente.</p>")
+                    
+                    with gr.Column(scale=1):
+                        wiki_list_display = gr.Markdown(
+                            value="_Sblocca il vault per vedere l'indice._",
+                            elem_classes="wiki-sidebar"
+                        )
+                
+                # Hidden component to trigger file opening
+                open_trigger = gr.Textbox(visible=False)
+                open_status = gr.Markdown("")
 
-        # ─── Footer ────────────────────────────────────────────
+        # ─── Event Handlers ─────────────────────────────────────
+
+
+        # Setup
+        check_btn.click(fn=on_check_system, outputs=system_status)
+        unlock_btn.click(fn=on_unlock_vault, inputs=password_input, outputs=unlock_status)
+        unlock_btn.click(fn=update_wiki_list, outputs=wiki_list_display)
+        profile_radio.change(fn=on_select_profile, inputs=profile_radio)
+        
+        # Wiki
+        check_folder_btn.click(
+            fn=on_check_folder,
+            inputs=folder_input,
+            outputs=[folder_info, changes_info],
+        )
+        compile_btn.click(
+            fn=on_compile_wiki,
+            inputs=folder_input,
+            outputs=compile_result,
+        )
+        compile_btn.click(fn=update_wiki_list, outputs=wiki_list_display)
+        clear_wiki_btn.click(
+            fn=on_clear_index,
+            outputs=clear_result,
+        )
+
+        # Chat
+        def handle_chat(msg, history):
+            # First, get the generator from on_chat_message
+            for new_history, _ in on_chat_message(msg, history):
+                # Extract file paths from the last message to update the "Found Files" area
+                last_content = new_history[-1]["content"] if new_history else ""
+                import re
+                paths = re.findall(r"\[APRI:\s*(.*?)\]", last_content)
+                
+                html_list = "<div style='display: flex; flex-wrap: wrap; gap: 10px;'>"
+                if not paths:
+                    html_list += "<p style='opacity: 0.5;'>Nessun file trovato in questo messaggio.</p>"
+                for p in paths:
+                    fname = Path(p).name
+                    html_list += f"""
+                    <button onclick="document.querySelector('#open-trigger-input').value='{p}'; 
+                                     document.querySelector('#open-trigger-input').dispatchEvent(new Event('submit'))" 
+                            style="padding: 8px 15px; background: #2d3436; color: white; border: none; border-radius: 5px; cursor: pointer; border-left: 4px solid #00b894;">
+                        📄 Apri {fname}
+                    </button>
+                    """
+                html_list += "</div>"
+                
+                yield new_history, "", html_list
+
+        # Assign unique ID to open_trigger for JS selection
+        open_trigger.elem_id = "open-trigger-input"
+
+        send_btn.click(
+            fn=handle_chat,
+            inputs=[chat_input, chatbot],
+            outputs=[chatbot, chat_input, found_files_container],
+        )
+        chat_input.submit(
+            fn=handle_chat,
+            inputs=[chat_input, chatbot],
+            outputs=[chatbot, chat_input, found_files_container],
+        )
+        
+        open_trigger.submit(fn=on_open_local_file, inputs=open_trigger, outputs=open_status)
+
+        # Footer
         gr.HTML(
             """
             <div class="privacy-footer">
-                🔒 PrivateSearch v1.0 — Elaborazione 100% locale.
-                Nessun dato viene trasmesso in rete.
-                Tutti i tuoi documenti restano sul tuo dispositivo.
+                🔒 PrivateSearch Wiki Edition — 100% Criptato. Nessun dato lascia il tuo PC.
             </div>
             """
         )
 
-        # Auto-check system status every time the page is loaded/refreshed
         app.load(fn=on_check_system, outputs=system_status)
 
     return app
@@ -744,31 +699,16 @@ def create_app() -> gr.Blocks:
 
 def main():
     """Launch the application."""
-    # Ensure data directories exist
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Initialize components
-    init_components()
-
-    # Check folder on startup if configured
-    config = UserConfig.load()
-    actual_folder = host_to_container_path(config.folder_path) if config.folder_path else ""
-    if actual_folder and Path(actual_folder).is_dir():
-        logger.info(f"Configured folder: {config.folder_path} → {actual_folder}")
-        files = scan_folder(actual_folder, ALL_EXTENSIONS)
-        if files and vector_store.has_changes(files):
-            logger.info("Changes detected in document folder")
-        else:
-            logger.info("No changes detected")
-
-    # Build and launch app
+    
+    # Don't init components until unlocked
+    
     app = create_app()
     app.launch(
         server_name=GRADIO_HOST,
         server_port=GRADIO_PORT,
-        share=False,          # Never share — privacy first
+        share=False,
         show_error=True,
-        favicon_path=None,
     )
 
 
